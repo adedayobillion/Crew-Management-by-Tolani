@@ -24,11 +24,13 @@ const pool = new Pool({
 
 app.disable('x-powered-by');
 app.set('trust proxy', 1); // Railway runs behind a proxy.
-app.use(helmet({ contentSecurityPolicy: false }));
-app.use(express.json({ limit: '32kb' }));
+app.use(helmet({ contentSecurityPolicy: { directives: { defaultSrc: ["'self'"], baseUri: ["'self'"], fontSrc: ["'self'", 'https://fonts.gstatic.com', 'data:'], styleSrc: ["'self'", "'unsafe-inline'", 'https://fonts.googleapis.com'], scriptSrc: ["'self'", "'unsafe-inline'"], imgSrc: ["'self'", 'data:', 'https:'], connectSrc: ["'self'"], objectSrc: ["'none'"], frameAncestors: ["'none'"], formAction: ["'self'"] } } }));
+app.use(express.json({ limit: '32kb', type: 'application/json' }));
+app.use((req,res,next)=>{ if(req.method !== 'GET' && req.method !== 'HEAD' && req.method !== 'OPTIONS' && req.get('origin')) { const origin = req.get('origin'); const host = req.get('host'); if (!host || origin !== `${req.protocol}://${host}`) return res.status(403).json({error:'Cross-origin requests are not allowed.'}); } next(); });
 app.use('/api/', rateLimit({ windowMs: 15 * 60 * 1000, limit: 180, standardHeaders: 'draft-7', legacyHeaders: false }));
 app.use(express.static(path.join(__dirname, 'public'), { dotfiles: 'ignore' }));
 const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 12, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'Too many sign-in attempts. Please wait and try again.' } });
+const adminLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 30, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'Too many admin requests. Please wait and try again.' } });
 
 const seedPros = [
   {id:1,name:'Tobi Adebayo',role:'Cinematographer',category:'Camera',location:'Lagos',rate:180000,rating:4.9,credits:'8 years experience',desc:'Commercials, music videos and branded visual stories.',skills:['Cinema camera','Lighting','Commercials']},
@@ -47,8 +49,12 @@ async function initDb() {
       email VARCHAR(254) NOT NULL UNIQUE,
       password_hash TEXT NOT NULL,
       account_type VARCHAR(12) NOT NULL CHECK (account_type IN ('client','crew')),
+      terms_accepted_at TIMESTAMPTZ,
+      terms_version VARCHAR(40),
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS terms_accepted_at TIMESTAMPTZ;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS terms_version VARCHAR(40);
     CREATE TABLE IF NOT EXISTS auth_sessions (
       id BIGSERIAL PRIMARY KEY,
       user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -134,7 +140,7 @@ function validDate(value) { return typeof value === 'string' && /^\d{4}-\d{2}-\d
 function dayCount(start, end) { return Math.floor((Date.parse(end+'T00:00:00Z') - Date.parse(start+'T00:00:00Z')) / 86400000) + 1; }
 function nairaRound(n) { return Math.round(Number(n)); }
 function parseCookies(header='') {
-  return Object.fromEntries(header.split(';').map(v=>v.trim()).filter(Boolean).map(v=>{const i=v.indexOf('=');return i<0?[v,'']:[v.slice(0,i),decodeURIComponent(v.slice(i+1))]}));
+  const out={}; for (const part of header.split(';').map(v=>v.trim()).filter(Boolean)) { const i=part.indexOf('='); if(i<0) continue; const key=part.slice(0,i); try { out[key]=decodeURIComponent(part.slice(i+1)); } catch { /* Ignore malformed cookie values rather than failing the request. */ } } return out;
 }
 function cookieOptions(maxAgeSeconds) {
   return `Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAgeSeconds}${process.env.NODE_ENV === 'production' ? '; Secure' : ''}`;
@@ -166,7 +172,8 @@ function adminOnly(req,res,next) {
   const expected = process.env.CMA_ADMIN_TOKEN;
   if (!expected) return res.status(503).json({error:'Admin API disabled: configure CMA_ADMIN_TOKEN in Railway Variables.'});
   const supplied = req.get('x-admin-token') || '';
-  if (supplied.length !== expected.length || !require('crypto').timingSafeEqual(Buffer.from(supplied), Buffer.from(expected))) return res.status(401).json({error:'Unauthorized'});
+  const suppliedBuf = Buffer.from(supplied); const expectedBuf = Buffer.from(expected);
+  if (suppliedBuf.length !== expectedBuf.length || !crypto.timingSafeEqual(suppliedBuf, expectedBuf)) return res.status(401).json({error:'Unauthorized'});
   next();
 }
 
@@ -185,9 +192,10 @@ app.post('/api/auth/register', authLimiter, async (req,res,next) => {
     if(!validEmail(email)) return res.status(400).json({error:'Enter a valid email address.'});
     if(password.length<10 || !/[A-Za-z]/.test(password) || !/\d/.test(password)) return res.status(400).json({error:'Use at least 10 characters with at least one letter and one number.'});
     if(!['client','crew'].includes(accountType)) return res.status(400).json({error:'Choose a client or crew account.'});
+    if (b.termsAccepted !== true) return res.status(400).json({error:'Please accept the Terms of Service and acknowledge the Privacy Policy.'});
     const passwordHash=await bcrypt.hash(password,12);
     let saved;
-    try { saved=await pool.query('INSERT INTO users(full_name,email,password_hash,account_type) VALUES($1,$2,$3,$4) RETURNING id,full_name,email,account_type',[name,email,passwordHash,accountType]); }
+    try { saved=await pool.query("INSERT INTO users(full_name,email,password_hash,account_type,terms_accepted_at,terms_version) VALUES($1,$2,$3,$4,NOW(),'2026-10-19-draft') RETURNING id,full_name,email,account_type",[name,email,passwordHash,accountType]); }
     catch(e) { if(e.code==='23505')return res.status(409).json({error:'An account with this email already exists. Sign in instead.'}); throw e; }
     const user=saved.rows[0];
     await createSession(user,res);
@@ -274,15 +282,15 @@ app.post('/api/crew-applications', requireAuth, requireRole('crew'), async (req,
   } catch(e) { next(e); }
 });
 // Admin endpoints are intentionally protected by a secret header. Never expose the token in browser code.
-app.get('/api/admin/bookings', adminOnly, async (req,res,next) => {
+app.get('/api/admin/bookings', adminLimiter, adminOnly, async (req,res,next) => {
   try { const r=await pool.query(`SELECT b.reference,b.client_name,b.client_email,p.name AS professional_name,p.role,b.project_type,b.booking_unit,b.start_date,b.end_date,b.project_location,b.proposed_overtime_terms,b.overtime_agreed,b.days,b.base_amount,b.client_fee,b.crew_commission,b.client_total,b.crew_net,b.agency_gross,b.status,b.payment_status,b.payout_status,b.created_at FROM bookings b JOIN professionals p ON p.id=b.professional_id ORDER BY b.created_at DESC LIMIT 250`); res.json({bookings:r.rows}); }
   catch(e){next(e);}
 });
-app.get('/api/admin/applications', adminOnly, async (_req,res,next) => {
+app.get('/api/admin/applications', adminLimiter, adminOnly, async (_req,res,next) => {
   try { const r=await pool.query('SELECT id,full_name,email,role,location,portfolio_url,bio,status,created_at FROM crew_applications ORDER BY created_at DESC LIMIT 250'); res.json({applications:r.rows}); }
   catch(e){next(e);}
 });
-app.patch('/api/admin/bookings/:reference/status', adminOnly, async (req,res,next) => {
+app.patch('/api/admin/bookings/:reference/status', adminLimiter, adminOnly, async (req,res,next) => {
   try {
     const allowed=['awaiting_review','awaiting_terms','confirmed','in_progress','completion_review','completed','disputed','cancelled','refunded'];
     const status=req.body && req.body.status;
