@@ -41,3 +41,15 @@ Review date: 2026-10-19
 Added `/admin.html` with server-protected endpoints for account review and moderation. Features include pending/approved/rejected states, manual verification flags, suspicious-activity flags, suspension/reactivation, internal notes, account search/filters, overview counts, audit events, and existing booking/application tables. All account actions require `CMA_ADMIN_TOKEN` in the `x-admin-token` request header and use the admin rate limiter. Suspensions and rejections revoke active sessions. New registrations default to `pending_review`; booking and crew application submission require approval. Existing accounts migrate as approved to avoid unexpected lockouts.
 
 Limitations remain: this uses one shared admin token, not named admin identities or MFA; manual “verified” is only a flag and does not itself verify identity; suspicious flags require human review; no automated fraud scoring is implemented. Protect and rotate the token, and use named admin accounts/MFA and a stronger audit policy before operating at scale. Static syntax checks passed; no live Railway/database end-to-end or penetration test was run in this environment.
+
+## Review fixes (2026-10-19)
+
+- CSP: added `scriptSrcAttr 'unsafe-inline'` (Helmet's default `script-src-attr 'none'` was blocking every inline `onclick`). Still a stopgap: move to external scripts to drop `unsafe-inline`.
+- Admin token is held in memory only (no `sessionStorage`); admin limiter counts failed attempts only (20/15 min).
+- Auth: failed-login limiter per IP and per email; separate sign-up limiter; dummy bcrypt compare removes the login timing difference; logout works for suspended users.
+- Frontend loads profiles from `/api/professionals` (built-in samples are only a fallback); ratings removed; seed no longer overwrites database edits.
+- Bookings: past start dates rejected, 10 requests per user per 24h, enforced status transitions, refund requires a collected payment, confirmation requires agreed overtime terms; DATE columns returned as plain strings.
+- Crew: duplicate pending applications rejected; admin can approve/reject applications and create a linked profile; crew see bookings via `GET /api/my/crew-bookings` (no crew UI yet).
+- Audit log now records booking status/overtime and application actions (actor is still the shared token).
+- Added `.env.example`, `.gitignore`, `package-lock.json`; removed duplicate root HTML files.
+- Tested against local PostgreSQL 16 and headless Chromium. Not done: email verification, password reset, MFA, named admin accounts, payments, external-script CSP.

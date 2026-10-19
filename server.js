@@ -2,7 +2,8 @@
 const express = require('express');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
-const { Pool } = require('pg');
+const { Pool, types } = require('pg');
+types.setTypeParser(1082, v => v); // keep DATE columns as 'YYYY-MM-DD' strings (no timezone shifts)
 const path = require('path');
 const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
@@ -24,13 +25,17 @@ const pool = new Pool({
 
 app.disable('x-powered-by');
 app.set('trust proxy', 1); // Railway runs behind a proxy.
-app.use(helmet({ contentSecurityPolicy: { directives: { defaultSrc: ["'self'"], baseUri: ["'self'"], fontSrc: ["'self'", 'https://fonts.gstatic.com', 'data:'], styleSrc: ["'self'", "'unsafe-inline'", 'https://fonts.googleapis.com'], scriptSrc: ["'self'", "'unsafe-inline'"], imgSrc: ["'self'", 'data:', 'https:'], connectSrc: ["'self'"], objectSrc: ["'none'"], frameAncestors: ["'none'"], formAction: ["'self'"] } } }));
+app.use(helmet({ contentSecurityPolicy: { directives: { defaultSrc: ["'self'"], baseUri: ["'self'"], fontSrc: ["'self'", 'https://fonts.gstatic.com', 'data:'], styleSrc: ["'self'", "'unsafe-inline'", 'https://fonts.googleapis.com'], scriptSrc: ["'self'", "'unsafe-inline'"], scriptSrcAttr: ["'unsafe-inline'"], imgSrc: ["'self'", 'data:', 'https:'], connectSrc: ["'self'"], objectSrc: ["'none'"], frameAncestors: ["'none'"], formAction: ["'self'"] } } }));
 app.use(express.json({ limit: '32kb', type: 'application/json' }));
 app.use((req,res,next)=>{ if(req.method !== 'GET' && req.method !== 'HEAD' && req.method !== 'OPTIONS' && req.get('origin')) { const origin = req.get('origin'); const host = req.get('host'); if (!host || origin !== `${req.protocol}://${host}`) return res.status(403).json({error:'Cross-origin requests are not allowed.'}); } next(); });
 app.use('/api/', rateLimit({ windowMs: 15 * 60 * 1000, limit: 180, standardHeaders: 'draft-7', legacyHeaders: false }));
 app.use(express.static(path.join(__dirname, 'public'), { dotfiles: 'ignore' }));
-const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 12, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'Too many sign-in attempts. Please wait and try again.' } });
-const adminLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 30, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'Too many admin requests. Please wait and try again.' } });
+const registerLimiter = rateLimit({ windowMs: 60 * 60 * 1000, limit: 10, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'Too many sign-up attempts. Please wait and try again.' } });
+const emailKey = req => 'e:' + String((req.body && req.body.email) || '').toLowerCase().slice(0,254);
+const loginEmailLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 8, skipSuccessfulRequests: true, keyGenerator: emailKey, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'Too many sign-in attempts for this account. Please wait and try again.' } });
+const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 30, skipSuccessfulRequests: true, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'Too many sign-in attempts. Please wait and try again.' } });
+const adminLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 20, skipSuccessfulRequests: true, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'Too many failed admin attempts. Please wait and try again.' } });
+const DUMMY_HASH = bcrypt.hashSync('timing-equalizer-not-a-real-password', 12);
 
 const seedPros = [
   {id:1,name:'Tobi Adebayo',role:'Cinematographer',category:'Camera',location:'Lagos',rate:180000,rating:4.9,credits:'8 years experience',desc:'Commercials, music videos and branded visual stories.',skills:['Cinema camera','Lighting','Commercials']},
@@ -128,6 +133,11 @@ async function initDb() {
       status VARCHAR(40) NOT NULL DEFAULT 'pending_review',
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
+    ALTER TABLE professionals ADD COLUMN IF NOT EXISTS user_id BIGINT REFERENCES users(id) ON DELETE SET NULL;
+    ALTER TABLE professionals ADD COLUMN IF NOT EXISTS application_id BIGINT;
+    ALTER TABLE professionals ALTER COLUMN rating DROP NOT NULL;
+    CREATE SEQUENCE IF NOT EXISTS professionals_id_seq START 1000;
+    CREATE INDEX IF NOT EXISTS professionals_user_idx ON professionals(user_id);
     ALTER TABLE bookings ADD COLUMN IF NOT EXISTS user_id BIGINT REFERENCES users(id) ON DELETE SET NULL;
     CREATE INDEX IF NOT EXISTS bookings_user_id_idx ON bookings(user_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS bookings_created_at_idx ON bookings(created_at DESC);
@@ -138,8 +148,8 @@ async function initDb() {
     await pool.query(`INSERT INTO professionals
       (id,name,role,category,location,daily_rate,rating,credits,description,skills)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb)
-      ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name,role=EXCLUDED.role,category=EXCLUDED.category,location=EXCLUDED.location,daily_rate=EXCLUDED.daily_rate,rating=EXCLUDED.rating,credits=EXCLUDED.credits,description=EXCLUDED.description,skills=EXCLUDED.skills`,
-      [p.id,p.name,p.role,p.category,p.location,p.rate,p.rating,p.credits,p.desc,JSON.stringify(p.skills)]);
+      ON CONFLICT (id) DO NOTHING`,
+      [p.id,p.name,p.role,p.category,p.location,p.rate,0,p.credits,p.desc,JSON.stringify(p.skills)]);
   }
 }
 function cleanString(value, max, field, {required=true}={}) {
@@ -196,7 +206,7 @@ app.get('/api/health', async (_req,res) => {
   catch (e) { res.status(503).json({ok:false,database:'unavailable'}); }
 });
 app.get('/api/config', (_req,res) => res.json({currency:'NGN',clientFeePercent:10,crewCommissionPercent:10,paymentsEnabled:process.env.PAYMENTS_ENABLED === 'true',paymentProvider:'Bachs.io (not connected)',payoutPolicy:'After project completion; subject to provider capability and dispute rules'}));
-app.post('/api/auth/register', authLimiter, async (req,res,next) => {
+app.post('/api/auth/register', registerLimiter, async (req,res,next) => {
   try {
     const b=req.body||{};
     const name=cleanString(b.name,120,'Full name');
@@ -216,19 +226,20 @@ app.post('/api/auth/register', authLimiter, async (req,res,next) => {
     res.status(201).json({user:publicUser(user),message:'Account created successfully.'});
   } catch(e) { next(e); }
 });
-app.post('/api/auth/login', authLimiter, async (req,res,next) => {
+app.post('/api/auth/login', authLimiter, loginEmailLimiter, async (req,res,next) => {
   try {
     const email=cleanString((req.body||{}).email,254,'Email').toLowerCase();
     const password=cleanString((req.body||{}).password,200,'Password');
     const r=await pool.query('SELECT id,full_name,email,password_hash,account_type,account_status,is_verified,is_suspicious,is_suspended FROM users WHERE email=$1',[email]);
-    if(!r.rowCount || !(await bcrypt.compare(password,r.rows[0].password_hash))) return res.status(401).json({error:'Email or password is incorrect.'});
+    const okPw=await bcrypt.compare(password,r.rowCount?r.rows[0].password_hash:DUMMY_HASH);
+    if(!r.rowCount || !okPw) return res.status(401).json({error:'Email or password is incorrect.'});
     const user=r.rows[0]; if(user.is_suspended || user.account_status==='rejected') return res.status(403).json({error:user.is_suspended?'This account is suspended. Contact support.':'This account was not approved. Contact support.',code:'ACCOUNT_RESTRICTED'}); await createSession(user,res);
     res.json({user:publicUser(user),message:'Signed in successfully.'});
   } catch(e) { next(e); }
 });
 app.get('/api/auth/me', optionalAuth, (req,res) => res.json({user:req.user?publicUser(req.user):null}));
-app.post('/api/auth/logout', optionalAuth, async (req,res,next) => {
-  try { if(req.user) await pool.query('DELETE FROM auth_sessions WHERE id=$1',[req.user.sessionId]); res.setHeader('Set-Cookie',`cma_session=; ${cookieOptions(0)}`);res.json({ok:true}); }
+app.post('/api/auth/logout', async (req,res,next) => {
+  try { const tok=parseCookies(req.headers.cookie||'').cma_session; if(tok) await pool.query('DELETE FROM auth_sessions WHERE token_hash=$1',[crypto.createHash('sha256').update(tok).digest('hex')]); res.setHeader('Set-Cookie',`cma_session=; ${cookieOptions(0)}`);res.json({ok:true}); }
   catch(e){next(e);}
 });
 app.get('/api/my/bookings', requireAuth, async (req,res,next) => {
@@ -238,7 +249,7 @@ app.get('/api/my/bookings', requireAuth, async (req,res,next) => {
 app.get('/api/professionals', async (req,res,next) => {
   try {
     const {category,location,q} = req.query;
-    const result = await pool.query(`SELECT id,name,role,category,location,daily_rate AS rate,rating,credits,description AS "desc",skills
+    const result = await pool.query(`SELECT id,name,role,category,location,daily_rate AS rate,credits,description AS "desc",skills
       FROM professionals WHERE active=TRUE AND ($1::text IS NULL OR category=$1) AND ($2::text IS NULL OR location=$2)
       AND ($3::text IS NULL OR (name || ' ' || role || ' ' || category || ' ' || description) ILIKE '%' || $3 || '%') ORDER BY id`,
       [category || null, location || null, q || null]);
@@ -259,10 +270,14 @@ app.post('/api/bookings', requireAuth, requireRole('client'), async (req,res,nex
     const endDate = bookingUnit === 'half' ? startDate : b.endDate;
     if (!validDate(startDate) || !validDate(endDate) || endDate < startDate) return res.status(400).json({error:'Choose valid start and end dates; end date must not be before start date.'});
     const days = bookingUnit === 'half' ? 0.5 : dayCount(startDate,endDate);
+    const today = new Date(Date.now() + 60*60*1000).toISOString().slice(0,10); // Lagos (UTC+1) calendar date
+    if (startDate < today) return res.status(400).json({error:'Start date cannot be in the past.'});
     if (days > 60) return res.status(400).json({error:'A single booking cannot exceed 60 calendar days in this test version.'});
     const projectLocation = cleanString(b.projectLocation,180,'Production location');
     const overtimeTerms = cleanString(b.overtimeTerms || '',1000,'Overtime terms',{required:false});
     const brief = cleanString(b.brief,8000,'Project brief');
+    const recent = await pool.query("SELECT COUNT(*)::int AS n FROM bookings WHERE user_id=$1 AND created_at > NOW() - INTERVAL '24 hours'",[req.user.id]);
+    if (recent.rows[0].n >= 10) return res.status(429).json({error:'Daily booking request limit reached. Please try again tomorrow.'});
     const proResult = await pool.query('SELECT id,name,role,daily_rate FROM professionals WHERE id=$1 AND active=TRUE',[professionalId]);
     if (!proResult.rowCount) return res.status(404).json({error:'Professional not found or inactive.'});
     const p = proResult.rows[0];
@@ -291,6 +306,8 @@ app.post('/api/crew-applications', requireAuth, requireRole('crew'), async (req,
     const portfolio=cleanString(b.portfolio || '',1000,'Portfolio URL',{required:false});
     if(portfolio && !/^https:\/\//i.test(portfolio)) return res.status(400).json({error:'Portfolio link must start with https://'});
     const bio=cleanString(b.bio,5000,'Skills and experience');
+    const dup=await pool.query("SELECT 1 FROM crew_applications WHERE lower(email)=lower($1) AND status='pending_review'",[email]);
+    if(dup.rowCount) return res.status(409).json({error:'You already have an application awaiting review.'});
     const saved=await pool.query(`INSERT INTO crew_applications(full_name,email,role,location,portfolio_url,bio) VALUES($1,$2,$3,$4,$5,$6) RETURNING id,status,created_at`,[name,email,role,location,portfolio,bio]);
     res.status(201).json({message:'Crew application received for review.',application:saved.rows[0]});
   } catch(e) { next(e); }
@@ -354,15 +371,76 @@ app.get('/api/admin/applications', adminLimiter, adminOnly, async (_req,res,next
   try { const r=await pool.query('SELECT id,full_name,email,role,location,portfolio_url,bio,status,created_at FROM crew_applications ORDER BY created_at DESC LIMIT 250'); res.json({applications:r.rows}); }
   catch(e){next(e);}
 });
+function audit(action, req, details={}, targetUserId=null) { return pool.query('INSERT INTO admin_audit_log(action,target_user_id,details,ip_address) VALUES($1,$2,$3::jsonb,$4)',[action,targetUserId,JSON.stringify(details),String(req.ip||'').slice(0,80)]); }
+const BOOKING_FLOW = {
+  awaiting_review:['awaiting_terms','cancelled'],
+  awaiting_terms:['awaiting_review','confirmed','cancelled'],
+  confirmed:['in_progress','cancelled','disputed'],
+  in_progress:['completion_review','disputed','cancelled'],
+  completion_review:['completed','disputed'],
+  completed:['disputed'],
+  disputed:['completed','cancelled','refunded'],
+  cancelled:['refunded'],
+  refunded:[]
+};
 app.patch('/api/admin/bookings/:reference/status', adminLimiter, adminOnly, async (req,res,next) => {
   try {
-    const allowed=['awaiting_review','awaiting_terms','confirmed','in_progress','completion_review','completed','disputed','cancelled','refunded'];
     const status=req.body && req.body.status;
-    if(!allowed.includes(status)) return res.status(400).json({error:'Invalid status.'});
+    if(!Object.keys(BOOKING_FLOW).includes(status)) return res.status(400).json({error:'Invalid status.'});
+    const cur=await pool.query('SELECT status,payment_status,overtime_agreed FROM bookings WHERE reference=$1',[req.params.reference]);
+    if(!cur.rowCount) return res.status(404).json({error:'Booking not found.'});
+    const from=cur.rows[0];
+    if(!BOOKING_FLOW[from.status].includes(status)) return res.status(409).json({error:`Cannot move a booking from ${from.status} to ${status}.`});
+    if(status==='refunded' && from.payment_status==='not_configured') return res.status(409).json({error:'No payment was collected, so nothing can be refunded.'});
+    if(status==='confirmed' && !from.overtime_agreed) { const t=await pool.query("SELECT proposed_overtime_terms FROM bookings WHERE reference=$1",[req.params.reference]); if(t.rows[0].proposed_overtime_terms) return res.status(409).json({error:'Overtime terms were proposed but are not marked agreed. Mark them agreed before confirming.'}); }
     const r=await pool.query('UPDATE bookings SET status=$1 WHERE reference=$2 RETURNING reference,status,payment_status,payout_status',[status,req.params.reference]);
-    if(!r.rowCount) return res.status(404).json({error:'Booking not found.'});
+    await audit('booking_status',req,{reference:req.params.reference,from:from.status,status});
     res.json({booking:r.rows[0]});
   }catch(e){next(e);}
+});
+app.patch('/api/admin/bookings/:reference/overtime-agreed', adminLimiter, adminOnly, async (req,res,next) => {
+  try {
+    if(typeof (req.body||{}).agreed!=='boolean') return res.status(400).json({error:'agreed must be true or false.'});
+    const r=await pool.query('UPDATE bookings SET overtime_agreed=$1 WHERE reference=$2 RETURNING reference,overtime_agreed',[req.body.agreed,req.params.reference]);
+    if(!r.rowCount) return res.status(404).json({error:'Booking not found.'});
+    await audit('booking_overtime',req,{reference:req.params.reference,agreed:req.body.agreed});
+    res.json({booking:r.rows[0]});
+  }catch(e){next(e);}
+});
+app.patch('/api/admin/applications/:id/status', adminLimiter, adminOnly, async (req,res,next) => {
+  try {
+    const id=Number(req.params.id); const status=(req.body||{}).status;
+    if(!Number.isSafeInteger(id)||id<1) return res.status(400).json({error:'Invalid application ID.'});
+    if(!['pending_review','approved','rejected'].includes(status)) return res.status(400).json({error:'Invalid status.'});
+    const r=await pool.query('UPDATE crew_applications SET status=$1 WHERE id=$2 RETURNING id,status',[status,id]);
+    if(!r.rowCount) return res.status(404).json({error:'Application not found.'});
+    await audit('application_status',req,{applicationId:id,status});
+    res.json({application:r.rows[0]});
+  }catch(e){next(e);}
+});
+// Turns an approved crew application into a bookable profile linked to the crew user's account.
+app.post('/api/admin/applications/:id/create-profile', adminLimiter, adminOnly, async (req,res,next) => {
+  try {
+    const id=Number(req.params.id); const b=req.body||{};
+    const dailyRate=Number(b.dailyRate); const category=cleanString(b.category,80,'Category');
+    if(!Number.isSafeInteger(id)||id<1) return res.status(400).json({error:'Invalid application ID.'});
+    if(!Number.isSafeInteger(dailyRate)||dailyRate<1||dailyRate>100000000) return res.status(400).json({error:'Enter a valid daily rate in whole naira.'});
+    const a=await pool.query('SELECT * FROM crew_applications WHERE id=$1',[id]);
+    if(!a.rowCount) return res.status(404).json({error:'Application not found.'});
+    const app_=a.rows[0];
+    const u=await pool.query("SELECT id FROM users WHERE email=$1 AND account_type='crew' AND account_status='approved' AND is_suspended=FALSE",[String(app_.email).toLowerCase()]);
+    if(!u.rowCount) return res.status(409).json({error:'No approved, active crew account matches this application email.'});
+    if((await pool.query('SELECT 1 FROM professionals WHERE application_id=$1',[id])).rowCount) return res.status(409).json({error:'A profile already exists for this application.'});
+    const saved=await pool.query(`INSERT INTO professionals(id,name,role,category,location,daily_rate,rating,credits,description,skills,user_id,application_id) VALUES(nextval('professionals_id_seq'),$1,$2,$3,$4,$5,0,'',$6,'[]'::jsonb,$7,$8) RETURNING id,name,role,category,location,daily_rate`,[app_.full_name,app_.role,category,app_.location,dailyRate,String(app_.bio).slice(0,500),u.rows[0].id,id]);
+    await pool.query("UPDATE crew_applications SET status='approved' WHERE id=$1",[id]);
+    await audit('create_profile',req,{applicationId:id,professionalId:saved.rows[0].id},u.rows[0].id);
+    res.status(201).json({professional:saved.rows[0]});
+  }catch(e){next(e);}
+});
+// Crew accounts can see booking requests made for their linked profile.
+app.get('/api/my/crew-bookings', requireAuth, requireRole('crew'), async (req,res,next) => {
+  try { const r=await pool.query(`SELECT b.reference,b.project_type,b.booking_unit,b.start_date,b.end_date,b.project_location,b.proposed_overtime_terms,b.days,b.base_amount,b.crew_commission,b.crew_net,b.status,b.created_at FROM bookings b JOIN professionals p ON p.id=b.professional_id WHERE p.user_id=$1 ORDER BY b.created_at DESC LIMIT 100`,[req.user.id]); res.json({bookings:r.rows}); }
+  catch(e){next(e);}
 });
 app.use('/api', (_req,res)=>res.status(404).json({error:'API route not found.'}));
 app.get('*', (req,res,next) => { if(req.path.startsWith('/api/')) return next(); res.sendFile(path.join(__dirname,'public','index.html')); });
