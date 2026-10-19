@@ -35,3 +35,9 @@ Review date: 2026-10-19
 8. A write request from a different browser origin is rejected.
 9. Admin routes reject missing/incorrect tokens and accept the correct secret only from a secure operator workflow.
 10. Test policy modal links, mobile layout, date selection, half-day/full-day price calculation, and keyboard Escape/close behavior.
+
+## Admin dashboard addition (2026-10-19)
+
+Added `/admin.html` with server-protected endpoints for account review and moderation. Features include pending/approved/rejected states, manual verification flags, suspicious-activity flags, suspension/reactivation, internal notes, account search/filters, overview counts, audit events, and existing booking/application tables. All account actions require `CMA_ADMIN_TOKEN` in the `x-admin-token` request header and use the admin rate limiter. Suspensions and rejections revoke active sessions. New registrations default to `pending_review`; booking and crew application submission require approval. Existing accounts migrate as approved to avoid unexpected lockouts.
+
+Limitations remain: this uses one shared admin token, not named admin identities or MFA; manual “verified” is only a flag and does not itself verify identity; suspicious flags require human review; no automated fraud scoring is implemented. Protect and rotate the token, and use named admin accounts/MFA and a stronger audit policy before operating at scale. Static syntax checks passed; no live Railway/database end-to-end or penetration test was run in this environment.

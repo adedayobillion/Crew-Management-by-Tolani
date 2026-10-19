@@ -51,10 +51,24 @@ async function initDb() {
       account_type VARCHAR(12) NOT NULL CHECK (account_type IN ('client','crew')),
       terms_accepted_at TIMESTAMPTZ,
       terms_version VARCHAR(40),
+      account_status VARCHAR(24) NOT NULL DEFAULT 'approved' CHECK (account_status IN ('pending_review','approved','rejected')),
+      is_verified BOOLEAN NOT NULL DEFAULT FALSE,
+      is_suspicious BOOLEAN NOT NULL DEFAULT FALSE,
+      is_suspended BOOLEAN NOT NULL DEFAULT FALSE,
+      admin_notes TEXT NOT NULL DEFAULT '',
+      reviewed_at TIMESTAMPTZ,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
     ALTER TABLE users ADD COLUMN IF NOT EXISTS terms_accepted_at TIMESTAMPTZ;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS terms_version VARCHAR(40);
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS account_status VARCHAR(24) NOT NULL DEFAULT 'approved';
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS is_verified BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS is_suspicious BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS is_suspended BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS admin_notes TEXT NOT NULL DEFAULT '';
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMPTZ;
+    CREATE INDEX IF NOT EXISTS users_admin_review_idx ON users(account_status, is_suspicious, is_suspended, created_at DESC);
+    CREATE TABLE IF NOT EXISTS admin_audit_log (id BIGSERIAL PRIMARY KEY, action VARCHAR(60) NOT NULL, target_user_id BIGINT REFERENCES users(id) ON DELETE SET NULL, details JSONB NOT NULL DEFAULT '{}'::jsonb, actor VARCHAR(80) NOT NULL DEFAULT 'admin-token', ip_address VARCHAR(80), created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
     CREATE TABLE IF NOT EXISTS auth_sessions (
       id BIGSERIAL PRIMARY KEY,
       user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -157,16 +171,16 @@ async function optionalAuth(req,res,next) {
     const token=parseCookies(req.headers.cookie||'').cma_session;
     if(!token) return next();
     const hash=crypto.createHash('sha256').update(token).digest('hex');
-    const r=await pool.query(`SELECT u.id,u.full_name,u.email,u.account_type,s.id AS session_id FROM auth_sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=$1 AND s.expires_at>NOW()`,[hash]);
-    if(r.rowCount) req.user={id:r.rows[0].id,name:r.rows[0].full_name,email:r.rows[0].email,accountType:r.rows[0].account_type,sessionId:r.rows[0].session_id};
+    const r=await pool.query(`SELECT u.id,u.full_name,u.email,u.account_type,u.account_status,u.is_verified,u.is_suspicious,u.is_suspended,s.id AS session_id FROM auth_sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=$1 AND s.expires_at>NOW()`,[hash]);
+    if(r.rowCount) { const u=r.rows[0]; if(u.is_suspended) { await pool.query('DELETE FROM auth_sessions WHERE id=$1',[u.session_id]); return res.status(403).json({error:'This account is suspended. Contact support.',code:'ACCOUNT_SUSPENDED'}); } req.user={id:u.id,name:u.full_name,email:u.email,accountType:u.account_type,accountStatus:u.account_status,isVerified:u.is_verified,isSuspicious:u.is_suspicious,sessionId:u.session_id}; }
     next();
   } catch(e) { next(e); }
 }
 function requireAuth(req,res,next) {
   optionalAuth(req,res,err=>{if(err)return next(err);if(!req.user)return res.status(401).json({error:'Please sign in to continue.',code:'AUTH_REQUIRED'});next();});
 }
-function requireRole(role) { return (req,res,next)=>{if(!req.user)return res.status(401).json({error:'Please sign in to continue.',code:'AUTH_REQUIRED'});if(req.user.accountType!==role)return res.status(403).json({error:`This action requires a ${role} account.`});next();}; }
-function publicUser(user) { return {id:user.id,name:user.name||user.full_name,email:user.email,accountType:user.accountType||user.account_type}; }
+function requireRole(role) { return (req,res,next)=>{if(!req.user)return res.status(401).json({error:'Please sign in to continue.',code:'AUTH_REQUIRED'});if(req.user.accountType!==role)return res.status(403).json({error:`This action requires a ${role} account.`});if(req.user.accountStatus!=='approved')return res.status(403).json({error:req.user.accountStatus==='rejected'?'This account was not approved. Contact support.':'Your account is awaiting admin approval.',code:'ACCOUNT_NOT_APPROVED'});next();}; }
+function publicUser(user) { return {id:user.id,name:user.name||user.full_name,email:user.email,accountType:user.accountType||user.account_type,accountStatus:user.accountStatus||user.account_status||'approved',isVerified:user.isVerified??user.is_verified??false,isSuspicious:user.isSuspicious??user.is_suspicious??false}; }
 
 function adminOnly(req,res,next) {
   const expected = process.env.CMA_ADMIN_TOKEN;
@@ -195,7 +209,7 @@ app.post('/api/auth/register', authLimiter, async (req,res,next) => {
     if (b.termsAccepted !== true) return res.status(400).json({error:'Please accept the Terms of Service and acknowledge the Privacy Policy.'});
     const passwordHash=await bcrypt.hash(password,12);
     let saved;
-    try { saved=await pool.query("INSERT INTO users(full_name,email,password_hash,account_type,terms_accepted_at,terms_version) VALUES($1,$2,$3,$4,NOW(),'2026-10-19-draft') RETURNING id,full_name,email,account_type",[name,email,passwordHash,accountType]); }
+    try { saved=await pool.query("INSERT INTO users(full_name,email,password_hash,account_type,account_status,terms_accepted_at,terms_version) VALUES($1,$2,$3,$4,'pending_review',NOW(),'2026-10-19-draft') RETURNING id,full_name,email,account_type,account_status,is_verified,is_suspicious",[name,email,passwordHash,accountType]); }
     catch(e) { if(e.code==='23505')return res.status(409).json({error:'An account with this email already exists. Sign in instead.'}); throw e; }
     const user=saved.rows[0];
     await createSession(user,res);
@@ -206,9 +220,9 @@ app.post('/api/auth/login', authLimiter, async (req,res,next) => {
   try {
     const email=cleanString((req.body||{}).email,254,'Email').toLowerCase();
     const password=cleanString((req.body||{}).password,200,'Password');
-    const r=await pool.query('SELECT id,full_name,email,password_hash,account_type FROM users WHERE email=$1',[email]);
+    const r=await pool.query('SELECT id,full_name,email,password_hash,account_type,account_status,is_verified,is_suspicious,is_suspended FROM users WHERE email=$1',[email]);
     if(!r.rowCount || !(await bcrypt.compare(password,r.rows[0].password_hash))) return res.status(401).json({error:'Email or password is incorrect.'});
-    const user=r.rows[0]; await createSession(user,res);
+    const user=r.rows[0]; if(user.is_suspended || user.account_status==='rejected') return res.status(403).json({error:user.is_suspended?'This account is suspended. Contact support.':'This account was not approved. Contact support.',code:'ACCOUNT_RESTRICTED'}); await createSession(user,res);
     res.json({user:publicUser(user),message:'Signed in successfully.'});
   } catch(e) { next(e); }
 });
@@ -281,7 +295,57 @@ app.post('/api/crew-applications', requireAuth, requireRole('crew'), async (req,
     res.status(201).json({message:'Crew application received for review.',application:saved.rows[0]});
   } catch(e) { next(e); }
 });
-// Admin endpoints are intentionally protected by a secret header. Never expose the token in browser code.
+// Admin endpoints are protected by a server-side secret; never embed CMA_ADMIN_TOKEN in public website code.
+app.get('/api/admin/overview', adminLimiter, adminOnly, async (_req,res,next) => {
+  try {
+    const [counts, recent] = await Promise.all([
+      pool.query(`SELECT COUNT(*)::int AS total, COUNT(*) FILTER (WHERE account_status='pending_review')::int AS pending, COUNT(*) FILTER (WHERE is_verified)::int AS verified, COUNT(*) FILTER (WHERE is_suspicious)::int AS suspicious, COUNT(*) FILTER (WHERE is_suspended)::int AS suspended, COUNT(*) FILTER (WHERE account_type='crew')::int AS crew, COUNT(*) FILTER (WHERE account_type='client')::int AS clients FROM users`),
+      pool.query(`SELECT id,full_name,email,account_type,account_status,is_verified,is_suspicious,is_suspended,created_at FROM users ORDER BY CASE WHEN is_suspended THEN 0 WHEN is_suspicious THEN 1 WHEN account_status='pending_review' THEN 2 ELSE 3 END, created_at DESC LIMIT 8`)
+    ]);
+    res.json({stats:counts.rows[0],recentUsers:recent.rows});
+  } catch(e){next(e);}
+});
+app.get('/api/admin/users', adminLimiter, adminOnly, async (req,res,next) => {
+  try {
+    const status = ['all','pending_review','approved','rejected'].includes(req.query.status) ? req.query.status : 'all';
+    const filter = ['all','suspicious','suspended','unverified'].includes(req.query.filter) ? req.query.filter : 'all';
+    const q = typeof req.query.q === 'string' ? req.query.q.trim().slice(0,100) : '';
+    const r = await pool.query(`SELECT id,full_name,email,account_type,account_status,is_verified,is_suspicious,is_suspended,admin_notes,terms_accepted_at,terms_version,created_at,reviewed_at FROM users WHERE ($1='all' OR account_status=$1) AND ($2='all' OR ($2='suspicious' AND is_suspicious=TRUE) OR ($2='suspended' AND is_suspended=TRUE) OR ($2='unverified' AND is_verified=FALSE)) AND ($3='' OR full_name ILIKE '%'||$3||'%' OR email ILIKE '%'||$3||'%') ORDER BY CASE WHEN is_suspended THEN 0 WHEN is_suspicious THEN 1 WHEN account_status='pending_review' THEN 2 ELSE 3 END, created_at DESC LIMIT 300`,[status,filter,q]);
+    res.json({users:r.rows});
+  } catch(e){next(e);}
+});
+app.patch('/api/admin/users/:id/action', adminLimiter, adminOnly, async (req,res,next) => {
+  const client = await pool.connect();
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isSafeInteger(id) || id < 1) return res.status(400).json({error:'Invalid account ID.'});
+    const action = req.body && req.body.action;
+    const notes = typeof (req.body||{}).notes === 'string' ? req.body.notes.trim().slice(0,2000) : null;
+    const allowed = ['approve','reject','verify','unverify','flag_suspicious','clear_suspicious','suspend','reactivate','save_notes'];
+    if(!allowed.includes(action)) return res.status(400).json({error:'Invalid account action.'});
+    await client.query('BEGIN');
+    let sql, params;
+    if(action==='approve'){sql="UPDATE users SET account_status='approved',reviewed_at=NOW() WHERE id=$1";params=[id];}
+    else if(action==='reject'){sql="UPDATE users SET account_status='rejected',reviewed_at=NOW() WHERE id=$1";params=[id];}
+    else if(action==='verify'){sql='UPDATE users SET is_verified=TRUE,reviewed_at=NOW() WHERE id=$1';params=[id];}
+    else if(action==='unverify'){sql='UPDATE users SET is_verified=FALSE,reviewed_at=NOW() WHERE id=$1';params=[id];}
+    else if(action==='flag_suspicious'){sql='UPDATE users SET is_suspicious=TRUE,reviewed_at=NOW() WHERE id=$1';params=[id];}
+    else if(action==='clear_suspicious'){sql='UPDATE users SET is_suspicious=FALSE,reviewed_at=NOW() WHERE id=$1';params=[id];}
+    else if(action==='suspend'){sql='UPDATE users SET is_suspended=TRUE,reviewed_at=NOW() WHERE id=$1';params=[id];}
+    else if(action==='reactivate'){sql='UPDATE users SET is_suspended=FALSE,reviewed_at=NOW() WHERE id=$1';params=[id];}
+    else { if(notes===null){await client.query('ROLLBACK');return res.status(400).json({error:'Notes must be text.'});} sql='UPDATE users SET admin_notes=$2,reviewed_at=NOW() WHERE id=$1';params=[id,notes]; }
+    const updated=await client.query(sql+' RETURNING id,full_name,email,account_type,account_status,is_verified,is_suspicious,is_suspended,admin_notes,created_at,reviewed_at',params);
+    if(!updated.rowCount){await client.query('ROLLBACK');return res.status(404).json({error:'Account not found.'});}
+    if(action==='suspend' || action==='reject') await client.query('DELETE FROM auth_sessions WHERE user_id=$1',[id]);
+    await client.query('INSERT INTO admin_audit_log(action,target_user_id,details,ip_address) VALUES($1,$2,$3::jsonb,$4)',[action,id,JSON.stringify({notes:action==='save_notes'?'updated':undefined}),String(req.ip||'').slice(0,80)]);
+    await client.query('COMMIT');
+    res.json({user:updated.rows[0],message:'Account action saved.'});
+  } catch(e){await client.query('ROLLBACK').catch(()=>{});next(e);} finally{client.release();}
+});
+app.get('/api/admin/audit-log', adminLimiter, adminOnly, async (_req,res,next) => {
+  try {const r=await pool.query(`SELECT a.id,a.action,a.target_user_id,a.details,a.ip_address,a.created_at,u.full_name AS target_name,u.email AS target_email FROM admin_audit_log a LEFT JOIN users u ON u.id=a.target_user_id ORDER BY a.created_at DESC LIMIT 200`);res.json({events:r.rows});}
+  catch(e){next(e);}
+});
 app.get('/api/admin/bookings', adminLimiter, adminOnly, async (req,res,next) => {
   try { const r=await pool.query(`SELECT b.reference,b.client_name,b.client_email,p.name AS professional_name,p.role,b.project_type,b.booking_unit,b.start_date,b.end_date,b.project_location,b.proposed_overtime_terms,b.overtime_agreed,b.days,b.base_amount,b.client_fee,b.crew_commission,b.client_total,b.crew_net,b.agency_gross,b.status,b.payment_status,b.payout_status,b.created_at FROM bookings b JOIN professionals p ON p.id=b.professional_id ORDER BY b.created_at DESC LIMIT 250`); res.json({bookings:r.rows}); }
   catch(e){next(e);}

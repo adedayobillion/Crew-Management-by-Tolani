@@ -97,3 +97,19 @@ The footer provides Terms of Service, Privacy Policy, Cancellation & Refunds, an
 This update adds a restrictive Content Security Policy (the current inline event-handler architecture still requires `unsafe-inline` for scripts), same-origin checks for browser write requests, HTML escaping for database-backed profile and booking text, safe cookie parsing, constant-time admin token comparison, and a separate admin API rate limit. It does not replace a professional security review.
 
 Remaining launch blockers include email verification, password reset, MFA, a real admin dashboard, admin token rotation/audit logs, stronger account lifecycle and privacy controls, persistent distributed rate limiting if scaled to multiple replicas, verified crew/profile workflows, and the Bachs.io checkout/webhook/refund/payout implementation. Test with non-sensitive data only until these are complete.
+
+## Admin dashboard and account moderation
+
+Open `/admin.html` on your deployed Railway domain. The dashboard is publicly reachable as a page, but its data and actions are protected by the `CMA_ADMIN_TOKEN` server-side variable; the token is not shipped in the marketplace HTML. Use a long random token, keep it private, and rotate it immediately if it is exposed. The browser keeps the token in `sessionStorage` for the current tab session; use **Lock console** on shared computers.
+
+The admin console provides:
+- Account overview counts and review queue.
+- Search and filter by approval state, suspicious flag, suspension, and verification state.
+- Approve or reject an account; mark or remove manual verification; flag or clear suspicious activity; suspend or reactivate an account; add internal notes.
+- Suspension and rejection revoke active login sessions. Suspended accounts are blocked from signing in and existing sessions are revoked.
+- Audit log of account actions, target account, timestamp, and request IP address.
+- Existing booking and crew-application review tables.
+
+Newly registered client and crew accounts start in `pending_review`. They may sign in, but booking and crew-application submission require an approved account. Existing accounts are migrated as approved to avoid unexpectedly locking out pre-existing users. The `is_verified` flag is a manual administrative label; the dashboard does not perform identity-document or liveness checks. Do not mark someone verified unless your team has actually completed its verification procedure. A suspicious flag is a review signal, not proof of wrongdoing.
+
+Before launch, consider replacing the shared admin token with named administrator accounts, MFA, role-based access, and a managed audit trail. Do not use the shared token on public/shared devices. The current dashboard is a first administrative console, not a complete compliance or identity-verification system.
