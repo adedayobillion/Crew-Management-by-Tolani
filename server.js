@@ -4,6 +4,8 @@ const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const { Pool } = require('pg');
 const path = require('path');
+const crypto = require('crypto');
+const bcrypt = require('bcryptjs');
 
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
@@ -26,18 +28,35 @@ app.use(helmet({ contentSecurityPolicy: false }));
 app.use(express.json({ limit: '32kb' }));
 app.use('/api/', rateLimit({ windowMs: 15 * 60 * 1000, limit: 180, standardHeaders: 'draft-7', legacyHeaders: false }));
 app.use(express.static(path.join(__dirname, 'public'), { dotfiles: 'ignore' }));
+const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 12, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'Too many sign-in attempts. Please wait and try again.' } });
 
 const seedPros = [
-  {id:1,name:'Tobi Akin',role:'Cinematographer',category:'Camera',location:'Lagos',rate:180000,rating:4.9,credits:'8 years experience',desc:'Visual storytelling for commercials, music videos and branded films.',skills:['Commercials','Music videos','Lighting']},
-  {id:2,name:'Mariam Okafor',role:'Film & Video Editor',category:'Editing',location:'Lagos',rate:120000,rating:4.8,credits:'6 years experience',desc:'Fast-paced edits, storytelling, social cuts and finishing.',skills:['Premiere Pro','DaVinci Resolve','Social cuts']},
-  {id:3,name:'Chidi Nwosu',role:'Production Manager',category:'Production',location:'Lagos',rate:150000,rating:4.9,credits:'10 years experience',desc:'Budgets, schedules, crew coordination and on-set logistics.',skills:['Scheduling','Budgeting','Logistics']},
-  {id:4,name:'Femi Balogun',role:'Gaffer / Lighting Technician',category:'Lighting',location:'Lagos',rate:95000,rating:4.8,credits:'7 years experience',desc:'Lighting plans, grip coordination and practical on-set execution.',skills:['LED lighting','Grip','Studio']},
-  {id:5,name:'Adaeze Eze',role:'Production Sound Mixer',category:'Sound',location:'Abuja',rate:100000,rating:4.7,credits:'6 years experience',desc:'Location sound recording, dialogue and audio equipment management.',skills:['Boom op','Wireless','Location sound']},
+  {id:1,name:'Tobi Adebayo',role:'Cinematographer',category:'Camera',location:'Lagos',rate:180000,rating:4.9,credits:'8 years experience',desc:'Commercials, music videos and branded visual stories.',skills:['Cinema camera','Lighting','Commercials']},
+  {id:2,name:'Amaka Okorie',role:'Production Manager',category:'Production',location:'Lagos',rate:120000,rating:4.9,credits:'6 years experience',desc:'Schedules, crew coordination and efficient on-set operations.',skills:['Scheduling','Crew calls','Budgets']},
+  {id:3,name:'Daniel Eze',role:'Video Editor',category:'Editing',location:'Remote',rate:85000,rating:4.8,credits:'5 years experience',desc:'Fast-paced edits for campaigns, social and long-form content.',skills:['Premiere Pro','DaVinci','Colour']},
+  {id:4,name:'Mariam Bello',role:'Gaffer / Lighting Tech',category:'Lighting',location:'Lagos',rate:95000,rating:4.8,credits:'7 years experience',desc:'Lighting setups for interviews, commercials and narrative shoots.',skills:['LED systems','Grip','Set safety']},
+  {id:5,name:'Chuka Nwosu',role:'Production Sound Mixer',category:'Sound',location:'Abuja',rate:100000,rating:4.7,credits:'6 years experience',desc:'Location sound recording, dialogue and audio equipment management.',skills:['Boom op','Wireless','Location sound']},
   {id:6,name:'Zainab Yusuf',role:'Makeup & Creative Artist',category:'Creative',location:'Lagos',rate:70000,rating:4.9,credits:'4 years experience',desc:'Camera-ready makeup and creative looks for talent and campaigns.',skills:['Beauty','Editorial','Set-ready']}
 ];
 
 async function initDb() {
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id BIGSERIAL PRIMARY KEY,
+      full_name VARCHAR(120) NOT NULL,
+      email VARCHAR(254) NOT NULL UNIQUE,
+      password_hash TEXT NOT NULL,
+      account_type VARCHAR(12) NOT NULL CHECK (account_type IN ('client','crew')),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS auth_sessions (
+      id BIGSERIAL PRIMARY KEY,
+      user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      token_hash CHAR(64) NOT NULL UNIQUE,
+      expires_at TIMESTAMPTZ NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS auth_sessions_expiry_idx ON auth_sessions(expires_at);
     CREATE TABLE IF NOT EXISTS professionals (
       id INTEGER PRIMARY KEY,
       name VARCHAR(120) NOT NULL,
@@ -89,6 +108,8 @@ async function initDb() {
       status VARCHAR(40) NOT NULL DEFAULT 'pending_review',
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
+    ALTER TABLE bookings ADD COLUMN IF NOT EXISTS user_id BIGINT REFERENCES users(id) ON DELETE SET NULL;
+    CREATE INDEX IF NOT EXISTS bookings_user_id_idx ON bookings(user_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS bookings_created_at_idx ON bookings(created_at DESC);
     CREATE INDEX IF NOT EXISTS bookings_status_idx ON bookings(status);
     CREATE INDEX IF NOT EXISTS applications_created_at_idx ON crew_applications(created_at DESC);
@@ -97,7 +118,7 @@ async function initDb() {
     await pool.query(`INSERT INTO professionals
       (id,name,role,category,location,daily_rate,rating,credits,description,skills)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb)
-      ON CONFLICT (id) DO NOTHING`,
+      ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name,role=EXCLUDED.role,category=EXCLUDED.category,location=EXCLUDED.location,daily_rate=EXCLUDED.daily_rate,rating=EXCLUDED.rating,credits=EXCLUDED.credits,description=EXCLUDED.description,skills=EXCLUDED.skills`,
       [p.id,p.name,p.role,p.category,p.location,p.rate,p.rating,p.credits,p.desc,JSON.stringify(p.skills)]);
   }
 }
@@ -112,6 +133,35 @@ function validEmail(value) { return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value); }
 function validDate(value) { return typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value) && !Number.isNaN(Date.parse(value+'T00:00:00Z')) && new Date(value+'T00:00:00Z').toISOString().slice(0,10) === value; }
 function dayCount(start, end) { return Math.floor((Date.parse(end+'T00:00:00Z') - Date.parse(start+'T00:00:00Z')) / 86400000) + 1; }
 function nairaRound(n) { return Math.round(Number(n)); }
+function parseCookies(header='') {
+  return Object.fromEntries(header.split(';').map(v=>v.trim()).filter(Boolean).map(v=>{const i=v.indexOf('=');return i<0?[v,'']:[v.slice(0,i),decodeURIComponent(v.slice(i+1))]}));
+}
+function cookieOptions(maxAgeSeconds) {
+  return `Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAgeSeconds}${process.env.NODE_ENV === 'production' ? '; Secure' : ''}`;
+}
+async function createSession(user, res) {
+  const token=crypto.randomBytes(32).toString('base64url');
+  const hash=crypto.createHash('sha256').update(token).digest('hex');
+  const expiresAt=new Date(Date.now()+7*24*60*60*1000);
+  await pool.query('INSERT INTO auth_sessions(user_id,token_hash,expires_at) VALUES($1,$2,$3)',[user.id,hash,expiresAt]);
+  res.setHeader('Set-Cookie',`cma_session=${encodeURIComponent(token)}; ${cookieOptions(7*24*60*60)}`);
+}
+async function optionalAuth(req,res,next) {
+  try {
+    const token=parseCookies(req.headers.cookie||'').cma_session;
+    if(!token) return next();
+    const hash=crypto.createHash('sha256').update(token).digest('hex');
+    const r=await pool.query(`SELECT u.id,u.full_name,u.email,u.account_type,s.id AS session_id FROM auth_sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=$1 AND s.expires_at>NOW()`,[hash]);
+    if(r.rowCount) req.user={id:r.rows[0].id,name:r.rows[0].full_name,email:r.rows[0].email,accountType:r.rows[0].account_type,sessionId:r.rows[0].session_id};
+    next();
+  } catch(e) { next(e); }
+}
+function requireAuth(req,res,next) {
+  optionalAuth(req,res,err=>{if(err)return next(err);if(!req.user)return res.status(401).json({error:'Please sign in to continue.',code:'AUTH_REQUIRED'});next();});
+}
+function requireRole(role) { return (req,res,next)=>{if(!req.user)return res.status(401).json({error:'Please sign in to continue.',code:'AUTH_REQUIRED'});if(req.user.accountType!==role)return res.status(403).json({error:`This action requires a ${role} account.`});next();}; }
+function publicUser(user) { return {id:user.id,name:user.name||user.full_name,email:user.email,accountType:user.accountType||user.account_type}; }
+
 function adminOnly(req,res,next) {
   const expected = process.env.CMA_ADMIN_TOKEN;
   if (!expected) return res.status(503).json({error:'Admin API disabled: configure CMA_ADMIN_TOKEN in Railway Variables.'});
@@ -125,6 +175,44 @@ app.get('/api/health', async (_req,res) => {
   catch (e) { res.status(503).json({ok:false,database:'unavailable'}); }
 });
 app.get('/api/config', (_req,res) => res.json({currency:'NGN',clientFeePercent:10,crewCommissionPercent:10,paymentsEnabled:process.env.PAYMENTS_ENABLED === 'true',paymentProvider:'Bachs.io (not connected)',payoutPolicy:'After project completion; subject to provider capability and dispute rules'}));
+app.post('/api/auth/register', authLimiter, async (req,res,next) => {
+  try {
+    const b=req.body||{};
+    const name=cleanString(b.name,120,'Full name');
+    const email=cleanString(b.email,254,'Email').toLowerCase();
+    const password=cleanString(b.password,200,'Password');
+    const accountType=b.accountType;
+    if(!validEmail(email)) return res.status(400).json({error:'Enter a valid email address.'});
+    if(password.length<10 || !/[A-Za-z]/.test(password) || !/\d/.test(password)) return res.status(400).json({error:'Use at least 10 characters with at least one letter and one number.'});
+    if(!['client','crew'].includes(accountType)) return res.status(400).json({error:'Choose a client or crew account.'});
+    const passwordHash=await bcrypt.hash(password,12);
+    let saved;
+    try { saved=await pool.query('INSERT INTO users(full_name,email,password_hash,account_type) VALUES($1,$2,$3,$4) RETURNING id,full_name,email,account_type',[name,email,passwordHash,accountType]); }
+    catch(e) { if(e.code==='23505')return res.status(409).json({error:'An account with this email already exists. Sign in instead.'}); throw e; }
+    const user=saved.rows[0];
+    await createSession(user,res);
+    res.status(201).json({user:publicUser(user),message:'Account created successfully.'});
+  } catch(e) { next(e); }
+});
+app.post('/api/auth/login', authLimiter, async (req,res,next) => {
+  try {
+    const email=cleanString((req.body||{}).email,254,'Email').toLowerCase();
+    const password=cleanString((req.body||{}).password,200,'Password');
+    const r=await pool.query('SELECT id,full_name,email,password_hash,account_type FROM users WHERE email=$1',[email]);
+    if(!r.rowCount || !(await bcrypt.compare(password,r.rows[0].password_hash))) return res.status(401).json({error:'Email or password is incorrect.'});
+    const user=r.rows[0]; await createSession(user,res);
+    res.json({user:publicUser(user),message:'Signed in successfully.'});
+  } catch(e) { next(e); }
+});
+app.get('/api/auth/me', optionalAuth, (req,res) => res.json({user:req.user?publicUser(req.user):null}));
+app.post('/api/auth/logout', optionalAuth, async (req,res,next) => {
+  try { if(req.user) await pool.query('DELETE FROM auth_sessions WHERE id=$1',[req.user.sessionId]); res.setHeader('Set-Cookie',`cma_session=; ${cookieOptions(0)}`);res.json({ok:true}); }
+  catch(e){next(e);}
+});
+app.get('/api/my/bookings', requireAuth, async (req,res,next) => {
+  try { const r=await pool.query(`SELECT b.reference,b.project_type,b.booking_unit,b.start_date,b.end_date,b.project_location,b.days,b.base_amount,b.client_fee,b.crew_commission,b.client_total,b.crew_net,b.agency_gross,b.status,b.payment_status,b.payout_status,b.created_at,p.name AS professional_name,p.role AS professional_role FROM bookings b JOIN professionals p ON p.id=b.professional_id WHERE b.user_id=$1 ORDER BY b.created_at DESC LIMIT 100`,[req.user.id]);res.json({bookings:r.rows}); }
+  catch(e){next(e);}
+});
 app.get('/api/professionals', async (req,res,next) => {
   try {
     const {category,location,q} = req.query;
@@ -135,14 +223,13 @@ app.get('/api/professionals', async (req,res,next) => {
     res.json({professionals:result.rows});
   } catch(e) { next(e); }
 });
-app.post('/api/bookings', async (req,res,next) => {
+app.post('/api/bookings', requireAuth, requireRole('client'), async (req,res,next) => {
   try {
     const b = req.body || {};
     const professionalId = Number(b.professionalId);
     if (!Number.isSafeInteger(professionalId) || professionalId < 1) return res.status(400).json({error:'A valid professionalId is required.'});
-    const clientName = cleanString(b.clientName,120,'Client name');
-    const clientEmail = cleanString(b.clientEmail,254,'Client email');
-    if (!validEmail(clientEmail)) return res.status(400).json({error:'Enter a valid email address.'});
+    const clientName = req.user.name;
+    const clientEmail = req.user.email;
     const projectType = cleanString(b.projectType,80,'Project type');
     const bookingUnit = b.bookingUnit;
     if (!['full','half'].includes(bookingUnit)) return res.status(400).json({error:'Booking type must be full or half.'});
@@ -165,19 +252,18 @@ app.post('/api/bookings', async (req,res,next) => {
     const agencyGross = clientFee + crewCommission;
     const reference = 'CMA-' + require('crypto').randomBytes(5).toString('hex').toUpperCase();
     const saved = await pool.query(`INSERT INTO bookings
-      (reference,professional_id,client_name,client_email,project_type,booking_unit,start_date,end_date,project_location,proposed_overtime_terms,project_brief,days,base_amount,client_fee,crew_commission,client_total,crew_net,agency_gross)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+      (reference,user_id,professional_id,client_name,client_email,project_type,booking_unit,start_date,end_date,project_location,proposed_overtime_terms,project_brief,days,base_amount,client_fee,crew_commission,client_total,crew_net,agency_gross)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
       RETURNING reference,status,payment_status,payout_status,days,base_amount,client_fee,crew_commission,client_total,crew_net,agency_gross,created_at`,
-      [reference,professionalId,clientName,clientEmail,projectType,bookingUnit,startDate,endDate,projectLocation,overtimeTerms,brief,days,base,clientFee,crewCommission,clientTotal,crewNet,agencyGross]);
+      [reference,req.user.id,professionalId,clientName,clientEmail,projectType,bookingUnit,startDate,endDate,projectLocation,overtimeTerms,brief,days,base,clientFee,crewCommission,clientTotal,crewNet,agencyGross]);
     res.status(201).json({message:'Booking request saved. This is not a confirmed booking and no payment has been taken.',booking:{...saved.rows[0],professionalName:p.name,professionalRole:p.role,bookingUnit,startDate,endDate,projectLocation,overtimeTerms},paymentsEnabled:process.env.PAYMENTS_ENABLED === 'true'});
   } catch(e) { next(e); }
 });
-app.post('/api/crew-applications', async (req,res,next) => {
+app.post('/api/crew-applications', requireAuth, requireRole('crew'), async (req,res,next) => {
   try {
     const b=req.body||{};
-    const name=cleanString(b.name,120,'Full name');
-    const email=cleanString(b.email,254,'Email');
-    if(!validEmail(email)) return res.status(400).json({error:'Enter a valid email address.'});
+    const name=req.user.name;
+    const email=req.user.email;
     const role=cleanString(b.role,100,'Primary role');
     const location=cleanString(b.location,120,'Base location');
     const portfolio=cleanString(b.portfolio || '',1000,'Portfolio URL',{required:false});

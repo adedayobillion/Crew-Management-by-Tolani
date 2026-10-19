@@ -12,7 +12,9 @@ This package contains the website plus a Node.js/Express API backed by PostgreSQ
 - `POST /api/bookings` stores booking requests and calculates all prices server-side.
 - `POST /api/crew-applications` stores crew applications.
 - Token-protected admin API endpoints for viewing booking/application submissions and changing booking status.
-- Website booking and crew application forms now submit to the API.
+- Responsive website with cleaner DM Sans / Manrope typography, a custom inline film-camera illustration, mobile-first layouts, accessible focus states, and bottom-sheet forms on small screens.
+- Account registration and login for client and crew account types. Passwords are hashed with bcrypt; sessions use random tokens stored as hashes in PostgreSQL and HttpOnly SameSite cookies.
+- Authenticated client-only booking requests and authenticated crew-only applications. Client booking history is loaded from the database.
 - 10% client service fee, 10% crew commission, full-day date ranges, and half-day bookings at 50% of the daily rate.
 - Overtime terms are captured as proposed terms; they must be agreed by client and crew before a booking is confirmed.
 - Crew payout policy is after project completion, subject to provider capability and the platform's dispute/refund policy.
@@ -24,11 +26,22 @@ This package contains the website plus a Node.js/Express API backed by PostgreSQ
 3. In Railway, add a **PostgreSQL** database service to the project.
 4. In the web service Variables, add `DATABASE_URL` by referencing the PostgreSQL service's `DATABASE_URL` variable. Railway may offer an “Add Reference” picker.
 5. Add `CMA_ADMIN_TOKEN` as a long, random secret. Do not put it in the HTML, Git repository, or share it publicly.
-6. Keep `PAYMENTS_ENABLED=false`. The Bachs.io payment integration is not implemented yet.
-7. Deploy. Railway runs `npm start` automatically. Open the generated public domain.
-8. Test `https://YOUR-DOMAIN/api/health`; it should return `ok: true` and `database: "connected"`.
+6. Set `NODE_ENV=production` in Railway Variables so session cookies use the `Secure` flag over HTTPS.
+7. Keep `PAYMENTS_ENABLED=false`. Bachs.io checkout and payouts are not connected yet.
+8. Deploy. Railway runs `npm start` automatically. Open the generated public domain.
+9. Test `https://YOUR-DOMAIN/api/health`; it should return `ok: true` and `database: "connected"`.
 
 Node.js 20+ is required. Railway will install packages using `package.json`. The app binds to `0.0.0.0` and uses Railway's `PORT` variable.
+
+## Authentication API
+
+- `POST /api/auth/register` — `{ "name": "Your Name", "email": "you@example.com", "password": "minimum10chars1", "accountType": "client" }` (or `crew`).
+- `POST /api/auth/login` — `{ "email": "you@example.com", "password": "..." }`; successful login sets an HttpOnly session cookie.
+- `GET /api/auth/me` — current account or `user: null`.
+- `POST /api/auth/logout` — revoke the current session.
+- `GET /api/my/bookings` — authenticated client booking history.
+
+Passwords must be at least 10 characters and contain at least one letter and one number. Registration and login endpoints have a separate rate limit. Cookie sessions are stored in PostgreSQL as SHA-256 hashes; passwords are hashed with bcrypt. This is not a substitute for a security audit.
 
 ## Admin API (test use)
 
@@ -54,12 +67,12 @@ curl -H "x-admin-token: $CMA_ADMIN_TOKEN" https://YOUR-DOMAIN/api/admin/bookings
 
 The server ignores client-submitted prices and looks up the professional's stored rate. For a full-day booking, the number of days includes both start and end dates. A half-day is 0.5 of the daily rate and uses a single date. The server stores an immutable price snapshot: base rate, 10% client fee, 10% crew commission, client total, crew net and gross agency commission. Currency is NGN and amounts are stored as integer naira for this prototype.
 
-Booking requests are **not confirmed bookings**. Payment status is `not_configured`; no payment is collected. The local demo dashboard only shows requests submitted in the current browser session; use the protected admin API to see persisted submissions across sessions.
+Booking requests are **not confirmed bookings**. Payment status is `not_configured`; no payment is collected. The client dashboard reads the authenticated user’s persisted bookings from `GET /api/my/bookings`.
 
 ## Important limitations before public use
 
-- No user login or role-based customer/crew accounts yet. Public booking and application submission endpoints are rate-limited but do not authenticate submitters. Treat this as a controlled test environment and do not collect highly sensitive information.
-- The admin API is token protected, but a proper admin UI, token rotation, audit logs, and stronger operational controls are still needed.
+- Email verification, password reset, MFA, account deletion, privacy export, and a full admin dashboard are not implemented. Treat this as a test release until those operational features and policies are added. Registration currently establishes a session immediately; verify users before relying on account ownership.
+- The admin API is token protected, but a proper admin UI, token rotation, audit logs, and stronger operational controls are still needed. Sessions expire after seven days; users can log out to revoke their current session.
 - Bachs.io checkout, webhook signature verification, refunds, disputes, and crew payout integration are **not implemented**. Do not set `PAYMENTS_ENABLED=true` as that flag alone does not enable payments.
 - Before collecting real money, confirm Bachs sandbox/live credentials and support for marketplace delayed transfers/payouts. A browser redirect is not proof of payment; verified provider webhooks must be the source of truth. Never claim escrow unless both provider and legal arrangements support it.
 - Replace seeded profiles, names, rates, and ratings with verified real data before public launch. Add privacy/terms/cancellation policies and obtain appropriate legal review.
